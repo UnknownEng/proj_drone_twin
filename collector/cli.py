@@ -2,48 +2,107 @@ import argparse
 import json
 import os
 
-import numpy as np
+from collector import profile as prof
+from collector import quality
+from collector.schema import (
+    ATTITUDE_COLUMNS, BATTERY_COLUMNS, IMU_COLUMNS, MODE_COLUMNS, MOTOR_COLUMNS,
+    OPTIONAL_FILES, RC_COLUMNS, REQUIRED_FILES, SCHEMA_VERSION, UNITS,
+)
 
-from collector.schema import META_TEMPLATE
-from collector.adapters import betaflight
+COLUMNS = {
+    "imu": IMU_COLUMNS, "motors": MOTOR_COLUMNS, "rc_setpoints": RC_COLUMNS,
+    "attitude": ATTITUDE_COLUMNS, "battery": BATTERY_COLUMNS, "modes_events": MODE_COLUMNS,
+}
 
 
-def import_log(firmware, input_path, output_dir):
-    if firmware not in ("betaflight", "inav"):
-        raise SystemExit(f"Adapter for '{firmware}' not built yet (Day 2-3).")
+def _convert(firmware, input_path):
+    if firmware in ("betaflight", "inav"):
+        from collector.adapters import betaflight as a
+        df, headers = a.read_log(input_path)
+        return a.build(df, headers)
+    if firmware == "ardupilot":
+        from collector.adapters import ardupilot as a
+        return a.build(a.read_log(input_path))
+    raise SystemExit(f"No adapter for '{firmware}' yet (PX4 comes on Day 3).")
 
-    df, headers = betaflight.read_log(input_path)
-    imu, motors, rc = betaflight.to_unified(df)
 
+def import_log(firmware, input_path, output_dir, profile_path=None):
+    data, info = _convert(firmware, input_path)
     os.makedirs(output_dir, exist_ok=True)
-    imu.to_csv(os.path.join(output_dir, "imu.csv"), index=False)
-    motors.to_csv(os.path.join(output_dir, "motors.csv"), index=False)
-    rc.to_csv(os.path.join(output_dir, "rc_setpoints.csv"), index=False)
 
-    rate = 1.0 / float(np.median(np.diff(imu["t_s"].values)))
-    meta = json.loads(json.dumps(META_TEMPLATE))
-    meta["firmware"] = firmware
-    meta["source_file"] = os.path.basename(input_path)
-    meta["sample_rate_hz"] = round(rate, 1)
+    written = []
+    for name in REQUIRED_FILES + OPTIONAL_FILES:
+        df = data.get(name)
+        if df is not None and len(df):
+            df = df[COLUMNS[name]]
+            data[name] = df
+            df.to_csv(os.path.join(output_dir, f"{name}.csv"), index=False)
+            written.append(name)
+
+    drone = prof.load(profile_path) if profile_path else prof.template("unknown")
+    missing = prof.missing(drone)
+
+    meta = {
+        "schema_version": SCHEMA_VERSION,
+        "firmware": firmware,
+        "firmware_version": info["firmware_version"],
+        "vehicle": info["vehicle"],
+        "source_file": os.path.basename(input_path),
+        "files": written,
+        "capabilities": info["capabilities"],
+        "units": UNITS,
+        "units_verified": info["units_verified"],
+        "units_note": info["units_note"],
+        "frame_convention_verified": False,
+        "motor_output_range": info["motor_output_range"],
+        "adapter_notes": info["adapter_notes"],
+        "drone": drone,
+        "drone_profile_missing": missing,
+    }
+    rep = quality.analyze(data, meta)
+    meta["sample_rate_hz"] = rep["imu_rate_hz"]
+    meta["suitable_for_system_id"] = rep["suitable_for_system_id"]
+
     with open(os.path.join(output_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
+    quality.save(rep, output_dir)
 
-    print(f"Saved dataset to {output_dir}")
-    print(f"Samples: {len(imu)}   Duration: {imu['t_s'].iloc[-1]:.1f} s   Rate: {rate:.0f} Hz")
-    if rate < 500:
-        print("WARNING: logging rate under 500 Hz, weak for system ID.")
+    print(f"Saved dataset to {output_dir}  (files: {', '.join(written)})")
+    quality.print_report(rep, missing)
+
+
+def report_only(dataset_dir):
+    from trainer.loader import load_dataset
+    meta, data = load_dataset(dataset_dir)
+    rep = quality.analyze(data, meta)
+    quality.print_report(rep, meta.get("drone_profile_missing", []))
 
 
 def main():
     p = argparse.ArgumentParser(prog="collector")
     sub = p.add_subparsers(dest="cmd", required=True)
+
     imp = sub.add_parser("import", help="convert a flight log to the unified dataset")
-    imp.add_argument("--firmware", required=True)
+    imp.add_argument("--firmware", required=True, choices=["betaflight", "inav", "ardupilot"])
     imp.add_argument("--input", required=True)
     imp.add_argument("--output", required=True)
-    args = p.parse_args()
-    if args.cmd == "import":
-        import_log(args.firmware, args.input, args.output)
+    imp.add_argument("--profile", help="drone profile .yaml (mass, props, battery)")
+
+    rep = sub.add_parser("report", help="print the quality report of a dataset")
+    rep.add_argument("--dataset", required=True)
+
+    new = sub.add_parser("new-profile", help="create an empty drone profile")
+    new.add_argument("--name", required=True)
+    new.add_argument("--output", required=True)
+
+    a = p.parse_args()
+    if a.cmd == "import":
+        import_log(a.firmware, a.input, a.output, a.profile)
+    elif a.cmd == "report":
+        report_only(a.dataset)
+    elif a.cmd == "new-profile":
+        prof.save(prof.template(a.name), a.output)
+        print(f"Created {a.output}. Open it and fill in the values.")
 
 
 if __name__ == "__main__":

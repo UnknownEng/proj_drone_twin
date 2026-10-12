@@ -1,0 +1,10 @@
+name: test_quad
+mass_g: null
+frame_size_mm: null
+prop_size_in: null
+prop_pitch_in: null
+motor_model: null
+motor_kv: null
+battery_cells: null
+battery_mah: null
+notes: Fill in every field you know. Weigh the drone with battery, ready to fly.
